@@ -271,7 +271,7 @@ def get_cached_or_web_projections(week: int, sc: dict, want_skill: bool):
 
     # Fallbacks if any subset missing
     if k.empty:
-        df = fetch_fp_table(f"https://www.fantasypros.com/nfl/projections/k.php?week={week}&scoring=PPR}")
+        df = fetch_fp_table(f"https://www.fantasypros.com/nfl/projections/k.php?week={week}&scoring=PPR")
         k = k_from_df(df, sc)
     if dst.empty:
         df = fetch_fp_table(f"https://www.fantasypros.com/nfl/projections/dst.php?week={week}&scoring=PPR")
