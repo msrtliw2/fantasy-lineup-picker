@@ -1,1 +1,113 @@
-start workflow folder
+name: fetch-data-daily
+
+on:
+  schedule:
+    - cron: "0 5 * * *"   # daily at 05:00 UTC
+  workflow_dispatch:      # allow manual run from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests beautifulsoup4 html5lib nfl-data-py
+
+      - name: Fetch projections & injuries and write CSVs
+        run: |
+          python - << 'PY'
+          import os, time, requests, pandas as pd
+          from bs4 import BeautifulSoup
+          import nfl_data_py as nfl
+          from datetime import datetime
+
+          os.makedirs('data', exist_ok=True)
+          HEADERS = {"User-Agent":"fantasy-lineup-picker-bot/1.0"}
+
+          def fetch_table(url):
+            html = requests.get(url, headers=HEADERS, timeout=30).text
+            soup = BeautifulSoup(html, "html5lib")
+            table = soup.find("table")
+            if not table: return pd.DataFrame()
+            rows = table.find_all("tr")
+            header = [th.get_text(strip=True) for th in rows[0].find_all(['th','td'])]
+            out=[]
+            for r in rows[1:]:
+              tds=[td.get_text(' ', strip=True) for td in r.find_all('td')]
+              if not tds: continue
+              row={}
+              for i,h in enumerate(header[:len(tds)]):
+                row[h]=tds[i]
+              out.append(row)
+            return pd.DataFrame(out)
+
+          def save_csv(df, path):
+            if df is None or df.empty: return
+            df.to_csv(path, index=False)
+
+          weeks = range(1,19)
+          pos_urls = {
+            'QB':  "https://www.fantasypros.com/nfl/projections/qb.php?week={w}&scoring=PPR",
+            'RB':  "https://www.fantasypros.com/nfl/projections/rb.php?week={w}&scoring=PPR",
+            'WR':  "https://www.fantasypros.com/nfl/projections/wr.php?week={w}&scoring=PPR",
+            'TE':  "https://www.fantasypros.com/nfl/projections/te.php?week={w}&scoring=PPR",
+            'K':   "https://www.fantasypros.com/nfl/projections/k.php?week={w}&scoring=PPR",
+            'DST': "https://www.fantasypros.com/nfl/projections/dst.php?week={w}&scoring=PPR",
+          }
+
+          for w in weeks:
+            frames=[]
+            for pos, url_t in pos_urls.items():
+              url = url_t.format(w=w)
+              df = fetch_table(url)
+              if df.empty: 
+                time.sleep(1)
+                continue
+              df['position']=pos
+              if 'Player' in df.columns:
+                df['player_name'] = df['Player'].str.replace(r'\s*\(.*?\)','', regex=True).str.strip()
+              elif 'Team' in df.columns:
+                df['player_name'] = df['Team'].str.strip()
+              else:
+                df['player_name'] = df.iloc[:,0].astype(str)
+              df['week']=w
+              frames.append(df)
+              time.sleep(1)
+            if frames:
+              allpos = pd.concat(frames, ignore_index=True)
+              save_csv(allpos, f"data/projections_week_{w}.csv")
+
+          # Injuries for current year
+          year = datetime.utcnow().year
+          try:
+            inj = nfl.import_injuries([year])
+            inj.to_csv("data/injuries.csv", index=False)
+          except Exception as e:
+            print("Injuries fetch failed:", e)
+          PY
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.csv || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "update data"
+            git push
+          fi
