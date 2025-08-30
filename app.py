@@ -4,6 +4,7 @@ import numpy as np
 import requests
 from bs4 import BeautifulSoup
 import nfl_data_py as nfl
+import re
 
 st.set_page_config(page_title="Fantasy Lineup Picker", layout="wide")
 st.title("🏈 Weekly Fantasy Lineup Picker (ESPN-style) — Hosted")
@@ -75,24 +76,34 @@ else:
     sc = SC_DEFAULT.copy()
 
 st.sidebar.header("3) Lineup slots (ESPN default)")
-slots = {
-    "QB": st.sidebar.number_input("QB", 0, 2, 1),
-    "RB": st.sidebar.number_input("RB", 0, 5, 2),
-    "WR": st.sidebar.number_input("WR", 0, 5, 2),
-    "TE": st.sidebar.number_input("TE", 0, 3, 1),
-    "FLEX": st.sidebar.number_input("FLEX (RB/WR/TE)", 0, 3, 1),
-    "K": st.sidebar.number_input("K", 0, 2, 1),
-    "DST": st.sidebar.number_input("D/ST", 0, 2, 1),
-}
+# Use keys so we can set presets
+qb_n = st.sidebar.number_input("QB", 0, 2, 1, key="slot_qb")
+rb_n = st.sidebar.number_input("RB", 0, 5, 2, key="slot_rb")
+wr_n = st.sidebar.number_input("WR", 0, 5, 2, key="slot_wr")
+te_n = st.sidebar.number_input("TE", 0, 3, 1, key="slot_te")
+fx_n = st.sidebar.number_input("FLEX (RB/WR/TE)", 0, 3, 1, key="slot_flex")
+k_n  = st.sidebar.number_input("K", 0, 2, 1, key="slot_k")
+dst_n= st.sidebar.number_input("D/ST", 0, 2, 1, key="slot_dst")
+
+if st.sidebar.button("ESPN lineup preset (9 starters)"):
+    st.session_state.slot_qb = 1
+    st.session_state.slot_rb = 2
+    st.session_state.slot_wr = 2
+    st.session_state.slot_te = 1
+    st.session_state.slot_flex = 1
+    st.session_state.slot_k = 1
+    st.session_state.slot_dst = 1
+    st.sidebar.success("Preset applied. Scroll down.")
+
+slots = {"QB": qb_n, "RB": rb_n, "WR": wr_n, "TE": te_n, "FLEX": fx_n, "K": k_n, "DST": dst_n}
 
 st.sidebar.header("4) Your Roster (optional)")
-roster_text = st.sidebar.text_area("Paste names (one per line). Leave blank to use full pool.", height=140, placeholder="Justin Jefferson\nBijan Robinson\n...")
+roster_text = st.sidebar.text_area("Paste names (one per line). Leave blank to use full pool.", height=140, placeholder="Lamar Jackson\nBijan Robinson\nRavens D/ST\n...")
 only_mine = st.sidebar.checkbox("Only pick from my players", value=False)
 
 # Share link
 st.sidebar.markdown("---")
 if st.sidebar.button("Copy shareable league link"):
-    # encode a minimal set into query params
     qp = dict(
         year=str(year), week=str(week),
         es=True if preset == "ESPN (PPR)" else False,
@@ -238,9 +249,6 @@ def get_skill_proj(week: int, sc: dict) -> pd.DataFrame:
         def num(s):
             try: return float(str(s))
             except: return 0.0
-        pass_yd = num(df[find(["Pass Yds","Passing Yds"])] if find(["Pass Yds","Passing Yds"]) else 0.0)
-        frames.append(df[["player_name","position"]])
-        # compute via stat cols if present
         pyc = find(["Pass Yds","Passing Yds"]); ptd=find(["Pass TD"])
         ryc = find(["Rush Yds"]); rtd=find(["Rush TD"])
         recyc = find(["Rec Yds","Receiving Yds"]); rectd=find(["Rec TD"]); recs=find(["Receptions","Rec"])
@@ -257,7 +265,7 @@ def get_skill_proj(week: int, sc: dict) -> pd.DataFrame:
               )
         out = df[["player_name","position"]].copy()
         out["PPG"] = pts
-        frames[-1] = out
+        frames.append(out)
     if frames:
         return pd.concat(frames, ignore_index=True)
     return pd.DataFrame(columns=["player_name","position","PPG"])
@@ -284,61 +292,149 @@ if not k_proj.empty: frames.append(k_proj)
 if not dst_proj.empty: frames.append(dst_proj)
 pool = pd.concat(frames, ignore_index=True).dropna(subset=["player_name","position"])
 
+# -----------------------------
+# Smart roster name matching
+# -----------------------------
+def normalize_name(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^\w\s/]", " ", s)  # remove punctuation except slash
+    s = s.replace("d/st", "dst").replace("d st", "dst").replace("defense", "dst").replace("special teams", "dst")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def name_keys(full: str) -> list[str]:
+    n = normalize_name(full)
+    toks = n.split()
+    keys = set()
+    keys.add(" ".join(toks))
+    keys.add("".join(toks))  # no-space
+    if len(toks) >= 2:
+        first, last = toks[0], toks[-1]
+        keys.add(f"{first[0]} {last}")
+        keys.add(f"{first[0]}{last}")
+        keys.add(last)  # last-name key; we will only use if unique
+    # DST helpers: allow team nicknames like "ravens", city, or "bal"
+    for t in toks:
+        keys.add(t)
+    return list(keys)
+
+# Build reverse index for pool names
+pool_names = pool["player_name"].astype(str).tolist()
+pool_keys = {}
+last_counts = {}
+for name in pool_names:
+    toks = normalize_name(name).split()
+    if len(toks) >= 2:
+        last = toks[-1]
+        last_counts[last] = last_counts.get(last, 0) + 1
+
+for name in pool_names:
+    for k in name_keys(name):
+        if re.fullmatch(r"[a-z]+", k) and k in last_counts and last_counts[k] > 1:
+            # ambiguous last name; skip single-token key
+            continue
+        pool_keys.setdefault(k, set()).add(name)
+
+def match_roster(roster_lines: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    if not roster_lines:
+        return pool.copy(), []
+    wanted = []
+    unmatched = []
+    seen = set()
+    for raw in roster_lines:
+        q = normalize_name(raw)
+        if not q: 
+            continue
+        candidates = set()
+        for k in name_keys(q):
+            if k in pool_keys:
+                candidates |= pool_keys[k]
+        # if still nothing, try substring contains search
+        if not candidates:
+            for pname in pool_names:
+                if normalize_name(pname).find(q) >= 0:
+                    candidates.add(pname)
+        if candidates:
+            # take highest PPG among candidates
+            sub = pool[pool["player_name"].isin(candidates)].sort_values("PPG", ascending=False)
+            if not sub.empty:
+                best_name = sub.iloc[0]["player_name"]
+                if best_name not in seen:
+                    wanted.append(best_name)
+                    seen.add(best_name)
+            else:
+                unmatched.append(raw)
+        else:
+            unmatched.append(raw)
+    filtered = pool[pool["player_name"].isin(wanted)]
+    return filtered, unmatched
+
 if only_mine:
-    my_names = {n.strip().lower() for n in roster_text.splitlines() if n.strip()}
-    pool = pool[pool["player_name"].str.lower().isin(my_names)]
+    roster_list = [x.strip() for x in roster_text.splitlines() if x.strip()]
+    pool, unmatched = match_roster(roster_list)
+else:
+    unmatched = []
 
 # -----------------------------
-# Lineup optimization
+# Lineup optimization (fill all base slots, then FLEX)
 # -----------------------------
 def pick_best(pool: pd.DataFrame, slots: dict):
-    df = pool.sort_values("PPG", ascending=False).reset_index(drop=True)
-    need = slots.copy()
+    df = pool.sort_values("PPG", ascending=False).reset_index(drop=True).copy()
     chosen = []
 
     def take(pos, n):
         nonlocal df, chosen
         if n <= 0: return
         got = df[df["position"] == pos].head(n).copy()
-        got = got.assign(slot=pos)
-        chosen.append(got)
-        df = df.drop(got.index)
+        if not got.empty:
+            got = got.assign(slot=pos)
+            chosen.append(got)
+            df = df.drop(got.index)
 
-    # fixed
-    for pos in ["QB","K","DST"]:
-        take(pos, need.get(pos,0))
+    # Fill fixed positions exactly by requested counts
+    take("QB", int(slots.get("QB",0)))
+    take("RB", int(slots.get("RB",0)))
+    take("WR", int(slots.get("WR",0)))
+    take("TE", int(slots.get("TE",0)))
+    take("K",  int(slots.get("K",0)))
+    take("DST",int(slots.get("DST",0)))
 
-    # base RB/WR/TE without flex
-    for pos in ["RB","WR","TE"]:
-        base_n = need.get(pos,0)
-        # hold back for flex competition
-        base_n = max(0, base_n - need.get("FLEX",0))
-        take(pos, base_n)
-
-    remaining = df.copy()
-    # FLEX from RB/WR/TE
-    flex_n = need.get("FLEX",0)
+    # FLEX from remaining RB/WR/TE
+    flex_n = int(slots.get("FLEX",0))
     if flex_n > 0:
-        candidates = remaining[remaining["position"].isin(["RB","WR","TE"])].head(flex_n).copy()
-        if not candidates.empty:
-            candidates["slot"] = "FLEX"
-            chosen.append(candidates)
-            remaining = remaining.drop(candidates.index)
+        flex_pool = df[df["position"].isin(["RB","WR","TE"])].head(flex_n).copy()
+        if not flex_pool.empty:
+            flex_pool["slot"] = "FLEX"
+            chosen.append(flex_pool)
+            df = df.drop(flex_pool.index)
 
-    out = pd.concat(chosen, ignore_index=True) if chosen else pd.DataFrame(columns=["player_name","position","PPG","slot"])
-    # number RB/WR/TE
-    def add_num(pos):
-        idx = out.index[out["slot"] == pos].tolist()
-        for i, j in enumerate(sorted(idx, key=lambda k: -out.loc[k,"PPG"]), start=1):
-            out.loc[j,"slot"] = f"{pos}{i}"
-    for p in ["RB","WR","TE"]:
-        add_num(p)
+    if chosen:
+        out = pd.concat(chosen, ignore_index=True)
+    else:
+        out = pd.DataFrame(columns=["player_name","position","PPG","slot"])
 
-    order = ["QB","RB1","RB2","WR1","WR2","TE","FLEX","K","DST"]
+    # Number RB/WR/TE slots (RB1, RB2, WR1, WR2, etc.)
+    def number_slot(df_slots: pd.DataFrame, base: str):
+        idx = df_slots.index[df_slots["slot"] == base].tolist()
+        if not idx:
+            return
+        # sort by PPG desc for numbering
+        idx_sorted = sorted(idx, key=lambda j: -df_slots.loc[j, "PPG"])
+        for i, j in enumerate(idx_sorted, start=1):
+            df_slots.loc[j, "slot"] = f"{base}{i}"
+
+    for base in ["RB","WR","TE"]:
+        number_slot(out, base)
+
+    # Sort in ESPN display order
+    order = ["QB","RB1","RB2","WR1","WR2","TE1","TE","FLEX","K","DST"]
     out["slot_order"] = out["slot"].apply(lambda s: order.index(s) if s in order else 99)
     out = out.sort_values(["slot_order","PPG"], ascending=[True, False]).drop(columns=["slot_order"])
 
-    bench = remaining.sort_values("PPG", ascending=False).head(20)
+    # Bench suggestions
+    taken_names = set(out["player_name"]) if not out.empty else set()
+    bench = df[~df["player_name"].isin(taken_names)].sort_values("PPG", ascending=False).head(20)
+
     return out, bench
 
 picked, bench = pick_best(pool, slots)
@@ -346,24 +442,30 @@ picked, bench = pick_best(pool, slots)
 # -----------------------------
 # Output
 # -----------------------------
-left, right = st.columns([2,1])
-with left:
+col_left, col_right = st.columns([2,1])
+with col_left:
     st.subheader("✅ Your Starting Lineup")
     if picked.empty:
         st.error("No players available for required slots. Paste your roster or uncheck 'Only pick from my players'.")
     else:
-        st.dataframe(picked[["slot","player_name","position","PPG"]].reset_index(drop=True), use_container_width=True)
+        show_cols = ["slot","player_name","position","PPG"]
+        st.dataframe(picked[show_cols].reset_index(drop=True), use_container_width=True)
         st.download_button("Download Lineup CSV",
-                           picked[["slot","player_name","position","PPG"]].to_csv(index=False).encode(),
+                           picked[show_cols].to_csv(index=False).encode(),
                            file_name=f"lineup_week{week}.csv", mime="text/csv")
 
-with right:
+with col_right:
     st.subheader("🪑 Bench Suggestions")
     if bench.empty:
         st.caption("No bench suggestions.")
     else:
         st.dataframe(bench[["player_name","position","PPG"]].reset_index(drop=True), use_container_width=True)
 
+# Unmatched roster feedback
+if only_mine and unmatched:
+    st.markdown("----")
+    st.warning(f"Unmatched roster names: {', '.join(unmatched)}")
+    st.caption("Tip: try full name or last name (unique), e.g., 'Lamar Jackson' or 'L. Jackson' or 'Jackson' if unique; for defenses, try 'Ravens D/ST' or 'Ravens'.")
+
 st.markdown("---")
 st.caption("Free sources: nflverse (via nfl-data-py) for last-season per-game; FantasyPros for week projections (K/DST always, skill optional), parsed with BeautifulSoup+html5lib. No lxml.")
-
