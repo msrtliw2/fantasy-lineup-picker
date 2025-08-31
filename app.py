@@ -1,23 +1,31 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests, os, re
+import requests, os, re, base64
 from pathlib import Path
 from bs4 import BeautifulSoup
 import nfl_data_py as nfl
 
 st.set_page_config(page_title="Fantasy Lineup Picker", layout="wide")
-st.title("🏈 Weekly Fantasy Lineup Picker (ESPN-style) — Hosted")
+st.title("🏈 Weekly Fantasy Lineup Picker (ESPN-style) — Fan Mode")
 
 # -----------------------------
 # Query params (shareable link)
 # -----------------------------
+def get_qp():
+    try:
+        return st.experimental_get_query_params()
+    except:
+        return {}
+
 def set_qp(**kwargs):
-    try: st.experimental_set_query_params(**kwargs)
-    except: pass
+    try:
+        st.experimental_set_query_params(**kwargs)
+    except:
+        pass
 
 # -----------------------------
-# Sidebar inputs
+# Sidebar inputs (Steps 1–3)
 # -----------------------------
 st.sidebar.header("1) Week & Data Source")
 year = st.sidebar.number_input("Season", min_value=2020, max_value=2030, value=2024, step=1)
@@ -76,17 +84,46 @@ k_n  = st.sidebar.number_input("K", 0, 2, 1, key="slot_k")
 dst_n= st.sidebar.number_input("D/ST", 0, 2, 1, key="slot_dst")
 slots = {"QB": qb_n, "RB": rb_n, "WR": wr_n, "TE": te_n, "FLEX": fx_n, "K": k_n, "DST": dst_n}
 
-st.sidebar.header("4) Your Roster (optional)")
-roster_text = st.sidebar.text_area("Paste names (one per line). Leave blank to use full pool.", height=140, placeholder="Lamar Jackson\nBijan Robinson\nRavens D/ST\n...")
-only_mine = st.sidebar.checkbox("Only pick from my players", value=False)
+# -----------------------------
+# Sidebar: Your roster (Step 4)
+# -----------------------------
+qp = get_qp()
+roster_from_qp = ""
+only_flag = False
+if "r" in qp and qp["r"]:
+    try:
+        roster_from_qp = base64.urlsafe_b64decode(qp["r"][0].encode()).decode("utf-8", "ignore")
+    except Exception:
+        try:
+            import urllib.parse as up
+            roster_from_qp = up.unquote_plus(qp["r"][0])
+        except Exception:
+            roster_from_qp = ""
+if "mine" in qp and qp["mine"]:
+    only_flag = qp["mine"][0].lower() in ("1","true","yes","on")
 
+st.sidebar.header("4) Your Roster (optional)")
+roster_text = st.sidebar.text_area(
+    "Paste names (one per line). Leave blank to use full pool.",
+    height=140,
+    value=roster_from_qp if roster_from_qp else "",
+    placeholder="Lamar Jackson\nBijan Robinson\nRavens D/ST\n..."
+)
+only_mine = st.sidebar.checkbox("Only pick from my players", value=only_flag)
+
+# Share link (includes roster if you want)
 st.sidebar.markdown("---")
-if st.sidebar.button("Copy shareable league link"):
-    qp = dict(year=str(year), week=str(week), es=(preset=="ESPN (PPR)"),
-              qb=slots["QB"], rb=slots["RB"], wr=slots["WR"], te=slots["TE"],
-              fx=slots["FLEX"], k=slots["K"], dst=slots["DST"])
-    set_qp(**qp)
-    st.sidebar.success("URL updated. Copy from the address bar.")
+if st.sidebar.button("Copy shareable league link (includes roster)"):
+    renc = base64.urlsafe_b64encode(roster_text.encode()).decode() if roster_text.strip() else None
+    qp_out = dict(
+        year=str(year), week=str(week), es=(preset=="ESPN (PPR)"),
+        qb=slots["QB"], rb=slots["RB"], wr=slots["WR"], te=slots["TE"],
+        fx=slots["FLEX"], k=slots["K"], dst=slots["DST"],
+    )
+    if renc: qp_out["r"] = renc
+    if only_mine: qp_out["mine"] = "1"
+    set_qp(**qp_out)
+    st.sidebar.success("URL updated. Copy from the address bar and share.")
 
 # -----------------------------
 # Data helpers
@@ -126,17 +163,15 @@ def baselines_ppg(df_weekly: pd.DataFrame, scoring: dict, season: int) -> pd.Dat
     agg["position"] = agg["position"].str.upper().str.replace(" ", "", regex=False)
     return agg
 
-# ---------- Cached projections loader (from repo/data) ----------
+# Cached projections from repo (via GitHub Action)
 @st.cache_data(show_spinner=False)
 def load_cached_projections(week: int) -> pd.DataFrame:
     path = Path(__file__).parent / "data" / f"projections_week_{week}.csv"
     if path.exists():
         try:
             df = pd.read_csv(path)
-            # Ensure expected minimal columns
             if "position" not in df.columns:
                 return pd.DataFrame()
-            # Normalize player_name
             if "player_name" not in df.columns:
                 if "Player" in df.columns:
                     df["player_name"] = df["Player"].astype(str)
@@ -149,24 +184,27 @@ def load_cached_projections(week: int) -> pd.DataFrame:
             return pd.DataFrame()
     return pd.DataFrame()
 
-# ---------- Web fallback scrapers (no lxml) ----------
+# Simple table scraper (no lxml)
 def fetch_fp_table(url: str) -> pd.DataFrame:
-    html = requests.get(url, headers={"User-Agent": "lineup-picker/1.0"}, timeout=30).text
-    soup = BeautifulSoup(html, "html5lib")
-    table = soup.find("table")
-    if not table: return pd.DataFrame()
-    rows = table.find_all("tr")
-    if not rows: return pd.DataFrame()
-    header = [th.get_text(strip=True) for th in rows[0].find_all(["th","td"])]
-    out=[]
-    for r in rows[1:]:
-        tds=[td.get_text(" ", strip=True) for td in r.find_all("td")]
-        if not tds: continue
-        row={}
-        for i,h in enumerate(header[:len(tds)]):
-            row[h]=tds[i]
-        out.append(row)
-    return pd.DataFrame(out)
+    try:
+        html = requests.get(url, headers={"User-Agent": "lineup-picker/1.0"}, timeout=30).text
+        soup = BeautifulSoup(html, "html5lib")
+        table = soup.find("table")
+        if not table: return pd.DataFrame()
+        rows = table.find_all("tr")
+        if not rows: return pd.DataFrame()
+        header = [th.get_text(strip=True) for th in rows[0].find_all(["th","td"])]
+        out=[]
+        for r in rows[1:]:
+            tds=[td.get_text(" ", strip=True) for td in r.find_all("td")]
+            if not tds: continue
+            row={}
+            for i,h in enumerate(header[:len(tds)]):
+                row[h]=tds[i]
+            out.append(row)
+        return pd.DataFrame(out)
+    except Exception:
+        return pd.DataFrame()
 
 def k_from_df(df: pd.DataFrame, sc: dict) -> pd.DataFrame:
     if df.empty: return df
@@ -180,11 +218,11 @@ def k_from_df(df: pd.DataFrame, sc: dict) -> pd.DataFrame:
             if any(x.lower() in c.lower() for x in cands):
                 return c
         return None
-    fgm = find(["FG","Field Goals Made","FGM"])
-    xpm = find(["XP","Extra Points Made","XPM"])
     def num(x):
         try: return float(str(x).replace("%",""))
         except: return 0.0
+    fgm = find(["FG","Field Goals Made","FGM"])
+    xpm = find(["XP","Extra Points Made","XPM"])
     FGM = df[fgm].map(num) if fgm else 0.0
     XPM = df[xpm].map(num) if xpm else 0.0
     out = pd.DataFrame({"player_name": df["player_name"]})
@@ -231,25 +269,22 @@ def skill_from_df(df: pd.DataFrame, pos: str, sc: dict) -> pd.DataFrame:
     def num(x):
         try: return float(str(x))
         except: return 0.0
-    py = df[find(["Pass Yds","Passing Yds"])].map(num) if find(["Pass Yds","Passing Yds"]) else 0.0
-    ptd= df[find(["Pass TD"])].map(num) if find(["Pass TD"]) else 0.0
-    ry = df[find(["Rush Yds"])].map(num) if find(["Rush Yds"]) else 0.0
-    rtd= df[find(["Rush TD"])].map(num) if find(["Rush TD"]) else 0.0
-    recy=df[find(["Rec Yds","Receiving Yds"])].map(num) if find(["Rec Yds","Receiving Yds"]) else 0.0
-    rectd=df[find(["Rec TD"])].map(num) if find(["Rec TD"]) else 0.0
-    recs= df[find(["Receptions","Rec"])].map(num) if find(["Receptions","Rec"]) else 0.0
-    twopt=df[find(["2PT"])].map(num) if find(["2PT"]) else 0.0
-    pts = (py*sc["pass_yd_pt"] + ptd*sc["pass_td"]
-           + ry*sc["rush_yd_pt"] + rtd*sc["rush_td"]
-           + recy*sc["rec_yd_pt"] + rectd*sc["rec_td"]
-           + recs*sc["reception"] + twopt*sc["two_pt"])
+    py = skill = 0.0
+    pyc = find(["Pass Yds","Passing Yds"]); ptd=find(["Pass TD"])
+    ryc = find(["Rush Yds"]); rtd=find(["Rush TD"])
+    recyc = find(["Rec Yds","Receiving Yds"]); rectd=find(["Rec TD"]); recs=find(["Receptions","Rec"])
+    twopt = find(["2PT"])
+    def col_or_zero(c): return df[c].map(num) if c else 0.0
+    pts = ( col_or_zero(pyc)*sc["pass_yd_pt"] + col_or_zero(ptd)*sc["pass_td"]
+            + col_or_zero(ryc)*sc["rush_yd_pt"] + col_or_zero(rtd)*sc["rush_td"]
+            + col_or_zero(recyc)*sc["rec_yd_pt"] + col_or_zero(rectd)*sc["rec_td"]
+            + col_or_zero(recs)*sc["reception"] + col_or_zero(twopt)*sc["two_pt"] )
     out = pd.DataFrame({"player_name": df["player_name"]})
     out["position"] = pos
     out["PPG"] = pts
     return out
 
 def get_cached_or_web_projections(week: int, sc: dict, want_skill: bool):
-    # Try cached CSV first
     cached = load_cached_projections(week)
     skill = pd.DataFrame(columns=["player_name","position","PPG"])
     k = pd.DataFrame(columns=["player_name","position","PPG"])
@@ -258,18 +293,14 @@ def get_cached_or_web_projections(week: int, sc: dict, want_skill: bool):
     if not cached.empty:
         cached_pos = cached.copy()
         if "position" in cached_pos.columns:
-            # K
             k = k_from_df(cached_pos[cached_pos["position"]=="K"].copy(), sc)
-            # DST
             dst = dst_from_df(cached_pos[cached_pos["position"]=="DST"].copy(), sc)
-            # Skill
             if want_skill:
                 frames=[]
                 for pos in ["QB","RB","WR","TE"]:
                     frames.append(skill_from_df(cached_pos[cached_pos["position"]==pos].copy(), pos, sc))
                 skill = pd.concat(frames, ignore_index=True) if frames else skill
 
-    # Fallbacks if any subset missing
     if k.empty:
         df = fetch_fp_table(f"https://www.fantasypros.com/nfl/projections/k.php?week={week}&scoring=PPR")
         k = k_from_df(df, sc)
@@ -299,7 +330,6 @@ with st.spinner("Loading data…"):
 want_skill = data_source.startswith("All")
 skill_proj, k_proj, dst_proj = get_cached_or_web_projections(week, sc, want_skill)
 
-# If not using all-skill projections, use baselines for skill positions
 skill_positions = ["QB","RB","WR","TE"]
 if want_skill and not skill_proj.empty:
     skill = skill_proj
@@ -311,9 +341,7 @@ if not k_proj.empty: frames.append(k_proj)
 if not dst_proj.empty: frames.append(dst_proj)
 pool = pd.concat(frames, ignore_index=True).dropna(subset=["player_name","position"])
 
-# -----------------------------
-# Smart roster name matching
-# -----------------------------
+# If user wants only their roster
 def normalize_name(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"[^\w\s/]", " ", s)
@@ -321,7 +349,7 @@ def normalize_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def name_keys(full: str) -> list[str]:
+def name_keys(full: str):
     n = normalize_name(full)
     toks = n.split()
     keys = set()
@@ -350,14 +378,14 @@ for name in pool_names:
             continue
         pool_keys.setdefault(k, set()).add(name)
 
-def match_roster(roster_lines: list[str]) -> tuple[pd.DataFrame, list[str]]:
+def match_roster(roster_lines):
     if not roster_lines:
         return pool.copy(), []
     wanted = []
     unmatched = []
     seen = set()
-    for raw in roster_lines:
-        q = normalize_name(raw)
+    for rawline in roster_lines:
+        q = normalize_name(rawline)
         if not q: 
             continue
         candidates = set()
@@ -376,9 +404,9 @@ def match_roster(roster_lines: list[str]) -> tuple[pd.DataFrame, list[str]]:
                     wanted.append(best)
                     seen.add(best)
             else:
-                unmatched.append(raw)
+                unmatched.append(rawline)
         else:
-            unmatched.append(raw)
+            unmatched.append(rawline)
     filtered = pool[pool["player_name"].isin(wanted)]
     return filtered, unmatched
 
@@ -389,11 +417,83 @@ else:
     unmatched = []
 
 # -----------------------------
-# Lineup optimization (fill all base slots, then FLEX)
+# Fan Mode controls (Step 5)
 # -----------------------------
-def pick_best(pool: pd.DataFrame, slots: dict):
-    df = pool.sort_values("PPG", ascending=False).reset_index(drop=True).copy()
+st.sidebar.header("5) Fan Mode")
+opt_mode = st.sidebar.radio("Optimize for", ["Balanced","Floor","Ceiling"], index=0, help="Balanced = PPG; Floor/Ceiling use recent-game volatility.")
+lock_names = st.sidebar.multiselect("Lock starters (optional)", sorted(pool["player_name"].unique().tolist()))
+exclude_names = st.sidebar.multiselect("Exclude players (optional)", [])
+
+# Compute recent volatility (std) and last-3 trend (safe fallback if missing)
+def compute_player_volatility(raw_df, scoring, season):
+    try:
+        d = raw_df[raw_df["season"] == season].copy()
+        d["pts"] = compute_points_from_stats(d, scoring)
+        # std & last3
+        grp = d.groupby("player_name", dropna=False)
+        stats = grp["pts"].agg(ppg="mean", std="std", games="count").reset_index()
+        # last 3 by week
+        last3 = (d.sort_values(["player_name","week"])
+                   .groupby("player_name")["pts"]
+                   .apply(lambda s: s.tail(3).mean() if len(s) else np.nan)).reset_index().rename(columns={"pts":"last3"})
+        out = stats.merge(last3, on="player_name", how="left")
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["player_name","ppg","std","games","last3"])
+
+vol = compute_player_volatility(raw, sc, year)
+vol = vol.fillna({"std":0.0, "last3":np.nan})
+
+# Merge vol into pool and compute OPT score
+pool = pool.merge(vol[["player_name","std","last3"]], on="player_name", how="left")
+pool["std"] = pool["std"].fillna(0.0)
+if opt_mode == "Balanced":
+    pool["OPT"] = pool["PPG"]
+elif opt_mode == "Ceiling":
+    pool["OPT"] = pool["PPG"] + 0.5*pool["std"]
+else:  # Floor
+    pool["OPT"] = pool["PPG"] - 0.5*pool["std"]
+
+# Apply excludes
+if exclude_names:
+    pool = pool[~pool["player_name"].isin(set(exclude_names))]
+
+# -----------------------------
+# Lineup optimization (respects locks)
+# -----------------------------
+def assign_locked(chosen_list, df, slots_left, locked_df):
+    """Place locked players into their slots; prefer base slot, then FLEX for RB/WR/TE."""
+    for _, r in locked_df.iterrows():
+        pos = r["position"]
+        # Base slot first
+        if slots_left.get(pos,0) > 0:
+            r2 = r.copy()
+            r2["slot"] = pos
+            chosen_list.append(r2.to_frame().T)
+            slots_left[pos] -= 1
+            # remove from pool
+            df.drop(df[(df["player_name"]==r["player_name"]) & (df["position"]==pos)].index, inplace=True, errors="ignore")
+        elif pos in ("RB","WR","TE") and slots_left.get("FLEX",0) > 0:
+            r2 = r.copy()
+            r2["slot"] = "FLEX"
+            chosen_list.append(r2.to_frame().T)
+            slots_left["FLEX"] -= 1
+            df.drop(df[(df["player_name"]==r["player_name"]) & (df["position"]==pos)].index, inplace=True, errors="ignore")
+        else:
+            raise ValueError(f"Too many locked at {pos}; no slot left.")
+
+def pick_best(pool_df: pd.DataFrame, slots_dict: dict, score_col="OPT", locked_names=None):
+    df = pool_df.sort_values(score_col, ascending=False).reset_index(drop=True).copy()
+    slots_left = {k:int(v) for k,v in slots_dict.items()}
     chosen = []
+
+    # Handle locks
+    if locked_names:
+        locked = df[df["player_name"].isin(set(locked_names))].copy()
+        try:
+            assign_locked(chosen, df, slots_left, locked)
+        except ValueError as e:
+            return pd.DataFrame(), pd.DataFrame(), str(e)
 
     def take(pos, n):
         nonlocal df, chosen
@@ -404,14 +504,12 @@ def pick_best(pool: pd.DataFrame, slots: dict):
             chosen.append(got)
             df = df.drop(got.index)
 
-    take("QB", int(slots.get("QB",0)))
-    take("RB", int(slots.get("RB",0)))
-    take("WR", int(slots.get("WR",0)))
-    take("TE", int(slots.get("TE",0)))
-    take("K",  int(slots.get("K",0)))
-    take("DST",int(slots.get("DST",0)))
+    # Fill remaining base slots
+    for p in ["QB","RB","WR","TE","K","DST"]:
+        take(p, slots_left.get(p,0))
 
-    flex_n = int(slots.get("FLEX",0))
+    # FLEX from remaining RB/WR/TE
+    flex_n = slots_left.get("FLEX",0)
     if flex_n > 0:
         flex_pool = df[df["position"].isin(["RB","WR","TE"])].head(flex_n).copy()
         if not flex_pool.empty:
@@ -419,12 +517,13 @@ def pick_best(pool: pd.DataFrame, slots: dict):
             chosen.append(flex_pool)
             df = df.drop(flex_pool.index)
 
-    out = pd.concat(chosen, ignore_index=True) if chosen else pd.DataFrame(columns=["player_name","position","PPG","slot"])
+    out = pd.concat(chosen, ignore_index=True) if chosen else pd.DataFrame(columns=["player_name","position","PPG","slot",score_col])
 
+    # Number RB/WR/TE
     def number_slot(df_slots: pd.DataFrame, base: str):
         idx = df_slots.index[df_slots["slot"] == base].tolist()
         if not idx: return
-        idx_sorted = sorted(idx, key=lambda j: -df_slots.loc[j, "PPG"])
+        idx_sorted = sorted(idx, key=lambda j: -df_slots.loc[j, score_col])
         for i, j in enumerate(idx_sorted, start=1):
             df_slots.loc[j, "slot"] = f"{base}{i}"
 
@@ -433,39 +532,59 @@ def pick_best(pool: pd.DataFrame, slots: dict):
 
     order = ["QB","RB1","RB2","WR1","WR2","TE1","TE","FLEX","K","DST"]
     out["slot_order"] = out["slot"].apply(lambda s: order.index(s) if s in order else 99)
-    out = out.sort_values(["slot_order","PPG"], ascending=[True, False]).drop(columns=["slot_order"])
+    out = out.sort_values(["slot_order",score_col], ascending=[True, False]).drop(columns=["slot_order"])
 
     taken = set(out["player_name"]) if not out.empty else set()
-    bench = df[~df["player_name"].isin(taken)].sort_values("PPG", ascending=False).head(20)
-    return out, bench
+    bench = df[~df["player_name"].isin(taken)].sort_values(score_col, ascending=False).head(20)
+    return out, bench, None
 
-picked, bench = pick_best(pool, slots)
+picked, bench, lock_err = pick_best(pool, slots, score_col="OPT", locked_names=lock_names)
 
 # -----------------------------
 # Output
 # -----------------------------
-col_left, col_right = st.columns([2,1])
-with col_left:
+left, right = st.columns([2,1])
+
+with left:
     st.subheader("✅ Your Starting Lineup")
-    if picked.empty:
+    if lock_err:
+        st.error(lock_err)
+    elif picked.empty:
         st.error("No players available for required slots. Paste your roster or uncheck 'Only pick from my players'.")
     else:
-        st.dataframe(picked[["slot","player_name","position","PPG"]].reset_index(drop=True), use_container_width=True)
+        show = picked[["slot","player_name","position","PPG","OPT"]].rename(columns={"OPT":"Score"})
+        st.dataframe(show.reset_index(drop=True), use_container_width=True)
+
+        # Reason notes under each starter (PPG, last-3)
+        st.markdown("**Why these picks**")
+        for _, r in picked.iterrows():
+            last3 = pool.loc[pool["player_name"]==r["player_name"], "last3"]
+            last3_val = None if last3.empty else last3.iloc[0]
+            bullets = []
+            bullets.append(f"PPG: {r['PPG']:.2f}")
+            if pd.notna(last3_val):
+                bullets.append(f"Last 3 avg: {last3_val:.2f}")
+            if opt_mode != "Balanced":
+                bullets.append(f"Mode: {opt_mode}")
+            st.markdown(f"- **{r['slot']} — {r['player_name']}** ({r['position']}): " + " • ".join(bullets))
+
         st.download_button("Download Lineup CSV",
-                           picked[["slot","player_name","position","PPG"]].to_csv(index=False).encode(),
+                           show.to_csv(index=False).encode(),
                            file_name=f"lineup_week{week}.csv", mime="text/csv")
 
-with col_right:
+with right:
     st.subheader("🪑 Bench Suggestions")
     if bench.empty:
         st.caption("No bench suggestions.")
     else:
-        st.dataframe(bench[["player_name","position","PPG"]].reset_index(drop=True), use_container_width=True)
+        st.dataframe(bench[["player_name","position","PPG","OPT"]].rename(columns={"OPT":"Score"}).reset_index(drop=True),
+                     use_container_width=True)
 
+# Unmatched roster names
 if only_mine and unmatched:
     st.markdown("----")
     st.warning(f"Unmatched roster names: {', '.join(unmatched)}")
     st.caption("Tip: try full name or last name (unique); for defenses use 'Ravens D/ST' or 'Ravens'.")
 
 st.markdown("---")
-st.caption("Data: nflverse (nfl_data_py) for last-season per-game; FantasyPros weekly projections cached via GitHub Actions (K/DST always, skill optional). No lxml.")
+st.caption("Data: nflverse (nfl_data_py) for last-season per-game; FantasyPros weekly projections cached via GitHub Actions (K/DST always, skill optional). No lxml. Fan Mode adds Locks/Excludes, Floor/Ceiling, and simple reasons.")
