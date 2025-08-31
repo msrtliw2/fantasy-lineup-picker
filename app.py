@@ -422,7 +422,8 @@ else:
 st.sidebar.header("5) Fan Mode")
 opt_mode = st.sidebar.radio("Optimize for", ["Balanced","Floor","Ceiling"], index=0, help="Balanced = PPG; Floor/Ceiling use recent-game volatility.")
 lock_names = st.sidebar.multiselect("Lock starters (optional)", sorted(pool["player_name"].unique().tolist()))
-exclude_names = st.sidebar.multiselect("Exclude players (optional)", [])
+exclude_options = sorted([n for n in pool["player_name"].unique().tolist() if n not in set(lock_names)])
+exclude_names = st.sidebar.multiselect("Exclude players (optional)", exclude_options)
 
 # Compute recent volatility (std) and last-3 trend (safe fallback if missing)
 def compute_player_volatility(raw_df, scoring, season):
